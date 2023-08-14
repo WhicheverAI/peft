@@ -16,6 +16,7 @@ import math
 import re
 import warnings
 import random
+random.seed(56)
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import List, Optional, Tuple, Union
@@ -23,6 +24,7 @@ from typing import List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from tqdm import tqdm
 
 from ..import_utils import is_bnb_4bit_available, is_bnb_available
 from ..utils import (
@@ -229,6 +231,67 @@ class GLoraModel(torch.nn.Module):
             peft_config.target_modules = TRANSFORMERS_MODELS_TO_LORA_TARGET_MODULES_MAPPING[model_config["model_type"]]
         return peft_config
 
+    @staticmethod
+    def _replace_module(parent, child_name, new_module, child):
+        setattr(parent, child_name, new_module)
+        new_module.weight = child.weight
+        if hasattr(child, "bias"):
+            if child.bias is not None:
+                new_module.bias = child.bias
+
+        if getattr(child, "state", None) is not None:
+            new_module.state = child.state
+            new_module.to(child.weight.device)
+
+        # dispatch to correct device
+        for name, module in new_module.named_modules():
+            if "glora_" in name:
+                module.to(child.weight.device)
+            if "ranknum" in name:
+                module.to(child.weight.device)
+
+    def merge_and_unload(self, progressbar: bool = False):
+        r"""
+        This method merges the LoRa layers into the base model. This is needed if someone wants to use the base model
+        as a standalone model.
+
+        Args:
+            progressbar (bool): whether to show a progressbar indicating the unload and merge process
+
+        Example:
+
+        ```py
+        >>> from transformers import AutoModelForCausalLM
+        >>> from peft import PeftModel
+
+        >>> base_model = AutoModelForCausalLM.from_pretrained("tiiuae/falcon-40b")
+        >>> peft_model_id = "smangrul/falcon-40B-int4-peft-glora-sfttrainer-sample"
+        >>> model = PeftModel.from_pretrained(base_model, peft_model_id)
+        >>> merged_model = model.merge_and_unload()
+        ```
+        """
+        return self._unload_and_optionally_merge(progressbar=progressbar)
+
+    def _unload_and_optionally_merge(self, merge=True, progressbar: bool = False):
+
+        key_list = [key for key, _ in self.model.named_modules() if "glora" not in key]
+        for key in tqdm(key_list, disable=not progressbar ):
+            try:
+                parent, target, target_name = _get_submodules(self.model, key)
+            except AttributeError:
+                continue
+            if isinstance(target, GLoraLayer):
+                bias = True
+                new_module = torch.nn.Linear(target.in_features, target.out_features, bias=bias)
+                if merge:
+                    target.merge()
+                self._replace_module(parent, target_name, new_module, target)
+
+            # save any additional trainable modules part of `modules_to_save`
+            if isinstance(target, ModulesToSaveWrapper):
+                setattr(parent, target_name, target.modules_to_save[target.active_adapter])
+
+        return self.model
 
 # Below code is based on https://github.com/microsoft/LoRA/blob/main/loralib/layers.py
 # and modified to work with PyTorch FSDP
@@ -275,7 +338,6 @@ class GLoraLayer:
                         for E in config_D_E:
                             config = {'A':A,'B':B,'C':C,'D':D,'E':E}
                             self.configs.append(config)
-        self.to(self.weight.device)
     
     def make_param(self, shape, config=None):
         if 'LoRA' in config:
@@ -301,27 +363,30 @@ class Linear(nn.Linear, GLoraLayer):
     ):
         nn.Linear.__init__(self, in_features, out_features, **kwargs)
         GLoraLayer.__init__(self, in_features=in_features, out_features=out_features, r=r, adapter_name=adapter_name)
+
         # Freezing the pre-trained weight matrix
         self.weight.requires_grad = False
 
         nn.Linear.reset_parameters(self)
         self.active_adapter = adapter_name
+        self.to(self.weight.device)
 
     def merge(self):
-        pass
-        # if self.merged:
-        #     warnings.warn("Already merged. Nothing to do.")
-        #     return
-        
-        # if self.r[self.active_adapter] > 0:
-        #     self.weight.data += (
-        #         transpose(
-        #             self.lora_B[self.active_adapter].weight @ self.lora_A[self.active_adapter].weight,
-        #             self.fan_in_fan_out,
-        #         )
-        #         * self.scaling[self.active_adapter]
-        #     )
-        #     self.merged = True
+        if self.merged:
+            warnings.warn("Already merged. Nothing to do.")
+            return
+        path_config = self.eval_config
+        A = self.prepare_path(path_config['A'], self.glora_Ad, self.glora_Au).to(self.weight.dtype)
+        B = self.prepare_path(path_config['B'], self.glora_Bd, self.glora_Bu).to(self.weight.dtype)
+        C = self.prepare_path(path_config['C'], self.glora_Cd, self.glora_Cu).to(self.weight.dtype)
+        D = self.prepare_path(path_config['D'], self.glora_D).to(self.weight.dtype)
+        E = self.prepare_path(path_config['E'], self.glora_E).to(self.weight.dtype)
+        self.weight.data += self.weight*A + B
+        if torch.is_tensor(self.bias):
+            self.bias.data += self.bias*D + E+torch.matmul(self.weight, C).squeeze()
+        else:
+            self.bias = nn.Parameter(E+torch.matmul(self.weight, C).squeeze())
+        self.merged = True
 
     def forward(self, x: torch.Tensor):
         previous_dtype = x.dtype
@@ -329,11 +394,11 @@ class Linear(nn.Linear, GLoraLayer):
             path_config = self.eval_config
         else:
             path_config = random.choice(self.configs)
-        A = self.prepare_path(path_config['A'], self.glora_Ad, self.glora_Au)
-        B = self.prepare_path(path_config['B'], self.glora_Bd, self.glora_Bu)
-        C = self.prepare_path(path_config['C'], self.glora_Cd, self.glora_Cu)
-        D = self.prepare_path(path_config['D'], self.glora_D)
-        E = self.prepare_path(path_config['E'], self.glora_E)
+        A = self.prepare_path(path_config['A'], self.glora_Ad, self.glora_Au).to(self.weight.dtype)
+        B = self.prepare_path(path_config['B'], self.glora_Bd, self.glora_Bu).to(self.weight.dtype)
+        C = self.prepare_path(path_config['C'], self.glora_Cd, self.glora_Cu).to(self.weight.dtype)
+        D = self.prepare_path(path_config['D'], self.glora_D).to(self.weight.dtype)
+        E = self.prepare_path(path_config['E'], self.glora_E).to(self.weight.dtype)
         if torch.is_tensor(self.bias):
             result = F.linear(x, self.weight + self.weight*A + B, bias=self.bias + self.bias*D + E+torch.matmul(self.weight, C).squeeze())
         else:
